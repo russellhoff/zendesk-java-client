@@ -1,0 +1,5 @@
+jdk:
+  - openjdk11
+install:
+  - mvn -B -ntp org.apache.maven.plugins:maven-wrapper-plugin:3.3.4:wrapper -Dmaven=3.9.9
+  - ./mvnw -B -ntp clean install

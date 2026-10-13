@@ -4,9 +4,14 @@ import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static org.junit.Assert.*;
 
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.asynchttpclient.DefaultAsyncHttpClient;
 import org.asynchttpclient.DefaultAsyncHttpClientConfig;
 import org.junit.Rule;
@@ -14,10 +19,22 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.zendesk.client.v2.model.Attachment;
 
+/**
+ * Tests attachment downloads with local HTTP endpoints.
+ *
+ * @since 1.7.0
+ */
 public class AttachmentDownloadTest {
+  /** Local Zendesk and redirect endpoints. */
   @Rule public WireMockRule api = new WireMockRule(options().dynamicPort());
+
+  /** Temporary destinations used by download tests. */
   @Rule public TemporaryFolder files = new TemporaryFolder();
+
+  /** Binary response body used to verify byte-for-byte downloads. */
   private static final byte[] BINARY = {0, -1, -128, 13, 10, 1, 65};
+
+  /** OAuth access token returned by the local endpoint. */
   private static final String TOKEN = "attachment-test-access-token";
 
   private String base() {
@@ -64,6 +81,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies metadata refresh, file output, overwrite behavior, and token reuse. */
   public void refreshesMetadataCopiesBytesCreatesParentsOverwritesAndReusesToken()
       throws Exception {
     token(TOKEN, 3600);
@@ -96,6 +114,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies OAuth token renewal during a download. */
   public void renewsExpiredTokenForMetadataAndDownload() throws Exception {
     token(TOKEN, 1);
     metadata(base() + "/binary");
@@ -117,6 +136,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies failed HTTP responses leave an existing destination untouched. */
   public void rejectsHttpErrorsWithoutTouchingExistingFile() throws Exception {
     token(TOKEN, 3600);
     metadata(base() + "/binary");
@@ -138,6 +158,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies invalid arguments are rejected before making HTTP requests. */
   public void rejectsInvalidArgumentsBeforeNetworkIo() throws Exception {
     try (Zendesk zd = oauth()) {
       Path target = files.getRoot().toPath().resolve("invalid");
@@ -153,6 +174,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies metadata without a usable content URL is rejected. */
   public void rejectsMissingOrBlankContentUrl() throws Exception {
     token(TOKEN, 3600);
     try (Zendesk zd = oauth()) {
@@ -169,6 +191,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies a missing attachment cannot produce a successful download. */
   public void missingMetadataIsNotASuccessfulDownload() throws Exception {
     token(TOKEN, 3600);
     api.stubFor(
@@ -184,6 +207,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies redirects work with the default HTTP client. */
   public void followsRedirectsWithDefaultClient() throws Exception {
     token(TOKEN, 3600);
     metadata(base() + "/redirect");
@@ -202,6 +226,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies cross-host redirects reuse the configured client. */
   public void followsRedirectToAnotherHostUsingTheSameClient() throws Exception {
     token(TOKEN, 3600);
     metadata(base() + "/redirect");
@@ -224,6 +249,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies credentials are withheld from a different port on the same host. */
   public void sameHostDifferentPortDoesNotReceiveAuthorization() throws Exception {
     token(TOKEN, 3600);
     com.github.tomakehurst.wiremock.WireMockServer cdn =
@@ -253,6 +279,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies external content URLs do not receive Zendesk credentials. */
   public void directExternalContentUrlDoesNotReceiveZendeskCredentials() throws Exception {
     token(TOKEN, 3600);
     metadata("http://127.0.0.1:" + api.port() + "/binary");
@@ -267,6 +294,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies authorization is not forwarded across scheme changes. */
   public void schemeChangeAndTlsDowngradeNeverForwardAuthorization() throws Exception {
     com.github.tomakehurst.wiremock.WireMockServer tls =
         new com.github.tomakehurst.wiremock.WireMockServer(
@@ -315,6 +343,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies download logs omit credentials and binary response content. */
   public void downloadDoesNotLogCredentialsOrBinaryBody() throws Exception {
     token(TOKEN, 3600);
     metadata(base() + "/binary");
@@ -336,6 +365,7 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies filesystem write errors are returned to the caller. */
   public void fileWriteFailuresArePropagated() throws Exception {
     token(TOKEN, 3600);
     metadata(base() + "/binary");
@@ -348,6 +378,90 @@ public class AttachmentDownloadTest {
   }
 
   @Test
+  /** Verifies metadata and content transport failures satisfy the checked IOException contract. */
+  public void transportFailuresArePropagatedFromMetadataAndContent() throws Exception {
+    Path target = files.newFile("transport-failure").toPath();
+    byte[] original = {5, 6};
+    Files.write(target, original);
+    for (String failedPath : new String[] {"/api/v2/attachments/7.json", "/binary"}) {
+      api.resetAll();
+      metadata(base() + "/binary");
+      content(200);
+      api.stubFor(
+          get(urlEqualTo(failedPath)).willReturn(aResponse().withFault(Fault.EMPTY_RESPONSE)));
+      try (DefaultAsyncHttpClient http =
+              new DefaultAsyncHttpClient(
+                  new DefaultAsyncHttpClientConfig.Builder()
+                      .setMaxRequestRetry(0)
+                      .setRequestTimeout(java.time.Duration.ofSeconds(2))
+                      .build());
+          Zendesk zd = new Zendesk.Builder(base()).setClient(http).setOauthToken(TOKEN).build()) {
+        assertThrows(IOException.class, () -> zd.downloadAttachment(7L, target));
+      }
+      assertArrayEquals(original, Files.readAllBytes(target));
+      api.verify(3, getRequestedFor(urlEqualTo(failedPath)));
+      if (!failedPath.equals("/binary")) {
+        api.verify(0, getRequestedFor(urlEqualTo("/binary")));
+      }
+    }
+  }
+
+  @Test
+  /** Verifies metadata interruption preserves the interrupt flag and leaves the file untouched. */
+  public void metadataInterruptionIsPropagated() throws Exception {
+    assertInterruptedDownload("/api/v2/attachments/7.json");
+  }
+
+  @Test
+  /** Verifies content interruption preserves the interrupt flag and leaves the file untouched. */
+  public void contentInterruptionIsPropagated() throws Exception {
+    assertInterruptedDownload("/binary");
+  }
+
+  private void assertInterruptedDownload(String delayedPath) throws Exception {
+    metadata(base() + "/binary");
+    content(200);
+    api.stubFor(get(urlEqualTo(delayedPath)).willReturn(okJson("{}").withFixedDelay(10000)));
+    Path target = files.newFile("interrupted").toPath();
+    byte[] original = {5, 6};
+    Files.write(target, original);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    AtomicBoolean interrupted = new AtomicBoolean();
+    try (Zendesk zd = new Zendesk.Builder(base()).setOauthToken(TOKEN).build()) {
+      Thread worker =
+          new Thread(
+              () -> {
+                try {
+                  zd.downloadAttachment(7L, target);
+                } catch (Throwable e) {
+                  failure.set(e);
+                  interrupted.set(Thread.currentThread().isInterrupted());
+                }
+              });
+      worker.start();
+      try {
+        org.awaitility.Awaitility.await()
+            .atMost(5, TimeUnit.SECONDS)
+            .until(() -> !api.findAll(getRequestedFor(urlEqualTo(delayedPath))).isEmpty());
+        worker.interrupt();
+        worker.join(5000);
+        assertFalse("Download must stop promptly", worker.isAlive());
+        assertTrue(String.valueOf(failure.get()), failure.get() instanceof InterruptedException);
+        assertTrue("Interrupt flag must be preserved", interrupted.get());
+        assertArrayEquals(original, Files.readAllBytes(target));
+        api.verify(1, getRequestedFor(urlEqualTo(delayedPath)));
+        if (!delayedPath.equals("/binary")) {
+          api.verify(0, getRequestedFor(urlEqualTo("/binary")));
+        }
+      } finally {
+        worker.interrupt();
+        worker.join(5000);
+      }
+    }
+  }
+
+  @Test
+  /** Verifies injected client redirect settings and headers are respected. */
   public void respectsInjectedClientRedirectPolicyAndConfiguredHeaders() throws Exception {
     metadata(base() + "/redirect");
     api.stubFor(

@@ -9,12 +9,16 @@ import java.util.function.Supplier;
 /**
  * Bounded synchronous retries, used only at explicitly selected read boundaries.
  *
- * @since FIXME
+ * @since 1.7.0
  */
 final class ReadRetry {
   private ReadRetry() {}
 
-  /** Interruptible wait strategy, replaceable in tests. */
+  /**
+   * Interruptible wait strategy, replaceable in tests.
+   *
+   * @since 1.7.0
+   */
   interface Sleeper {
     /** Waits for the specified number of milliseconds. */
     void sleep(long millis) throws InterruptedException;
